@@ -1,0 +1,112 @@
+# DISCLOSURE: one-shot vibecoded with DeepSeek, don't @ me
+
+name: Build sing-box per-AS rulesets
+
+on:
+  schedule:
+    # Every 6 hours, on the hour.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+# Don't let two runs fight over the ruleset branch.
+concurrency:
+  group: build-ruleset
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install sing-box
+        run: |
+          set -euo pipefail
+
+          # Ask the API for the release and pick the linux/amd64 tarball by name.
+          release=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest)
+
+          version=$(jq -r .tag_name <<<"$release" | sed 's/^v//')
+          url=$(jq -r '
+            .assets[]
+            | select(.name | test("linux.*amd64.*\\.tar\\.gz$"))
+            | .browser_download_url
+          ' <<<"$release" | head -n1)
+
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "could not find a linux/amd64 tarball in the latest release" >&2
+            jq -r '.assets[].name' <<<"$release" >&2
+            exit 1
+          fi
+
+          echo "installing sing-box v${version} from ${url}"
+          curl -fsSL "$url" -o /tmp/sing-box.tar.gz
+
+          mkdir -p /tmp/sing-box
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp/sing-box --strip-components=1
+          sudo install -m 0755 /tmp/sing-box/sing-box /usr/local/bin/sing-box
+
+          sing-box version
+
+      - name: Build rulesets
+        env:
+          BGP_TOOLS_API_KEY: ${{ secrets.BGP_TOOLS_API_KEY }}
+          BGP_USER_AGENT: ${{ vars.BGP_USER_AGENT || format('bgp2srs ({0})', github.repository) }}
+        run: |
+          set -euo pipefail
+          python bgp2srs.py \
+            --out-dir dist \
+            --min-prefixes 1 \
+            --workers 4
+
+      - name: Publish to ruleset branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          cd dist
+          git init -q -b ruleset
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.compression 9
+
+          git add -A
+          # Nothing changed? Skip the push.
+          if git diff --cached --quiet; then
+            echo "no changes since last run"
+            exit 0
+          fi
+
+          git commit -q -m "Update rulesets $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Orphan, force-pushed branch: history stays at one commit, so the
+          # repo doesn't grow by ~87k blobs every six hours.
+          git push --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            ruleset
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f dist/manifest.json ]; then
+            {
+              echo "### rulesets built"
+              echo
+              jq -r '"**ASes:** \(.asn_count)  \n**Prefixes:** \(.prefix_count)  \n**sing-box:** \(.sing_box)"' dist/manifest.json
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
