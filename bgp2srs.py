@@ -21,7 +21,7 @@ from pathlib import Path
 
 LOG = logging.getLogger("bgp2srs")
 
-DEFAULT_TABLE_URL = "https://bgp.tools/table.jsonl"
+DEFAULT_TABLE_URL = "https://bgp.tools/table.txt"
 DEFAULT_USER_AGENT = "bgp2srs/0.1 (+https://github.com/sochinorth/bgp2srs)"
 
 RULESET_FORMAT_VERSION = 3
@@ -43,7 +43,7 @@ def download_table(
     """Stream `url` into `dest`, retrying a few times on transient errors."""
     headers = {
         "User-Agent": user_agent,
-        "Accept": "application/x-ndjson, application/json, text/plain, */*",
+        "Accept": "text/plain",
     }
     if api_key:
         # bgp.tools accepts the API key in a header named after the service.
@@ -79,12 +79,16 @@ def download_table(
 # --------------------------------------------------------------------------- #
 # Parsing
 # --------------------------------------------------------------------------- #
-
 def parse_table(path: Path) -> dict[int, set[ipaddress._BaseNetwork]]:
-    """Return {asn: {network, ...}} from a bgp.tools JSONL dump."""
+    """Return {asn: {network, ...}} from a bgp.tools table.txt dump.
+
+    Each non-empty line is expected to contain exactly two whitespace-separated
+    fields: a CIDR prefix and an origin ASN, e.g. ``1.1.1.0/24 13335``.
+    """
     by_asn: dict[int, set[ipaddress._BaseNetwork]] = defaultdict(set)
     total = 0
     skipped = 0
+    skipped_samples: list[str] = []
 
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -92,11 +96,19 @@ def parse_table(path: Path) -> dict[int, set[ipaddress._BaseNetwork]]:
             if not line:
                 continue
             total += 1
+
+            parts = line.split()
+            if len(parts) != 2:
+                skipped += 1
+                if len(skipped_samples) < 3:
+                    skipped_samples.append(line[:200])
+                continue
+
+            cidr_str, asn_str = parts
             try:
-                record = json.loads(line)
-                network = ipaddress.ip_network(record["CIDR"], strict=False)
-                asn = int(record["ASN"])
-            except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                network = ipaddress.ip_network(cidr_str, strict=False)
+                asn = int(asn_str)
+            except (ValueError, TypeError):
                 skipped += 1
                 if len(skipped_samples) < 3:
                     skipped_samples.append(line[:200])
@@ -107,6 +119,8 @@ def parse_table(path: Path) -> dict[int, set[ipaddress._BaseNetwork]]:
 
     if skipped:
         LOG.warning("skipped %d unparseable lines", skipped)
+        for sample in skipped_samples:
+            LOG.debug("  sample: %s", sample)
     LOG.info(
         "parsed %d lines -> %d unique prefixes across %d origin ASes",
         total,
@@ -178,7 +192,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--table-url",
         default=os.environ.get("BGP_TABLE_URL", DEFAULT_TABLE_URL),
-        help="URL of the bgp.tools JSONL table",
+        help="URL of the bgp.tools table.txt (CIDR ASN format)",
     )
     parser.add_argument(
         "--table-file",
@@ -264,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit(f"table file not found: {table_path}")
             LOG.info("using existing table %s", table_path)
         else:
-            table_path = work_dir / "table.jsonl"
+            table_path = work_dir / "table.txt"
             download_table(
                 args.table_url,
                 table_path,
@@ -303,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
 
         jobs: list[tuple[int, Path, Path, int]] = []
         for asn, networks in sorted(selected):
-            shard_dir = out_dir / f"{asn // 1000}000"
+            shard_dir = out_dir / f"{(asn // 1000) * 1000}"
             shard_dir.mkdir(parents=True, exist_ok=True)
 
             source = src_dir / f"as{asn}.json"
